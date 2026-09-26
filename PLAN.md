@@ -6,9 +6,9 @@ You type a patient ID, press a button, and talk to a voice agent that answers qu
 ## What's decided so far
 - **Branch:** `frontend` (already created). When the work is done: push it, then open a pull request to `main`.
 - **Frontend:** React (Vite).
-- **Voice:** Vapi, using its web kit in the browser.
-- **Backend:** a small Python Flask server on port 5000. It serves the React app, holds the secret keys, and receives Vapi's webhook.
-- **Hosting:** Cloudflare Tunnel, which gives Vapi a public URL to call.
+- **Voice:** LiveKit. The browser joins a LiveKit room, and a Python LiveKit agent (`server/agent.py`) answers. Models run on LiveKit Inference, with Gemini 2.5 Flash Lite as the LLM.
+- **Backend:** a small Python Flask server on port 5000. It serves the React app, holds the secret keys, checks the patient, and issues LiveKit call tokens.
+- **Hosting:** localhost. The agent connects out to LiveKit Cloud, so no tunnel is needed.
 - **Data:** the backend calls the Integuru `ecw_demographics` API. Only the `read` action is allowed, so nothing in the medical records system can change.
 - **Design:** mockup A (centered card): header, patient ID box, one Start call button that becomes End call, transcript, and status line.
 - **Code style:** function names that explain themselves, and no comments. A review agent checks this after the build.
@@ -16,8 +16,8 @@ You type a patient ID, press a button, and talk to a voice agent that answers qu
 ## How it works
 1. You enter a patient ID and press **Start call**.
 2. The backend checks that the patient exists before the call starts.
-3. The browser starts the Vapi call and passes the patient ID along.
-4. When you ask a question, Vapi calls our webhook. The webhook fetches the record and returns only the demographic fields.
+3. The server returns a LiveKit token for a private room. The token sends the agent with only the patient ID attached.
+4. The agent loads the record, and its no-argument tool returns only the demographic fields.
 5. The agent answers out loud, and the page shows the live transcript.
 
 ## Option A details to add in the build
@@ -42,12 +42,14 @@ The rule: the page never shows a broken or half-finished state. Every failure tu
 **Voice call**
 - Microphone access blocked → tell the user how to allow it, and go back to the start screen.
 - The call fails to start, or drops partway through → "Call ended unexpectedly." The page resets cleanly.
-- The Vapi key is missing → the start button shows a setup message instead of failing silently.
+- The LiveKit keys are missing → the start button shows a setup message instead of failing silently.
+- The agent doesn't join within 20 seconds → "The assistant isn't available. Try again."
+- The browser blocks the agent's audio → a "Tap to hear the assistant" button appears.
 
-**Webhook (backend)**
-- Rejects any request that doesn't carry our shared secret.
-- Checks that the request has the expected shape. Bad input gets a safe reply; the webhook never crashes.
-- If the records lookup fails, the agent says "I couldn't get that record right now" instead of going quiet.
+**Agent (backend)**
+- Only the server can start a call for a patient: the signed LiveKit token carries the patient ID, and nothing else.
+- The agent's tool takes no arguments, so it can't be asked about a different patient.
+- If the records lookup fails or runs slow, the agent says "I couldn't get that record right now" instead of going quiet.
 
 **Page state**
 - The page is always in exactly one of these states: idle, checking, connecting, in call, ending, or error. Buttons and labels follow from that state, so mixed states can't happen.
@@ -61,4 +63,4 @@ The rule: the page never shows a broken or half-finished state. Every failure tu
 ## Needed from you
 - Pick a design: A or B.
 - An Integuru API key (from the interviewer).
-- A Vapi account: public key, private key, and an assistant (I can create the assistant through the API).
+- A LiveKit account: public key, private key, and an assistant (I can create the assistant through the API).
