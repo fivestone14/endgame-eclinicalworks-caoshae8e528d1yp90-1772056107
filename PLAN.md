@@ -36,7 +36,7 @@ The rule: the page never shows a broken or half-finished state. Every failure tu
 
 **Patient check (before the call)**
 - Patient not found → "No patient with that ID." The call doesn't start.
-- API slow (over 10 seconds) or down → retry once, then "Couldn't reach patient records. Try again."
+- API slow (over 20 seconds per try) or down → retry once, then "Couldn't reach patient records. Try again."
 - Bad API key or server problem → a friendly message on the page. The details go to the server log only.
 
 **Voice call**

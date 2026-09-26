@@ -11,7 +11,7 @@ from settings import Settings
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT_SECONDS = 10
+REQUEST_TIMEOUT_SECONDS = 20
 ATTEMPTS_BEFORE_GIVING_UP = 2
 ENVELOPE_KEYS_IN_PRIORITY_ORDER = ("output", "result", "data", "body")
 MAX_ENVELOPE_DEPTH = 3
