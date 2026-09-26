@@ -1,4 +1,4 @@
-const VERIFY_TIMEOUT_MS = 25000
+const VERIFY_TIMEOUT_MS = 45000
 const CONFIG_TIMEOUT_MS = 8000
 const RECORDS_UNREACHABLE = "Couldn't reach patient records. Try again."
 
