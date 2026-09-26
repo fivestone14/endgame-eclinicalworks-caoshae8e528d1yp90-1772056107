@@ -112,3 +112,9 @@ input[readonly] { color: var(--text-secondary); }
 .status.live { color: var(--success); }
 
 .fallback { text-align: center; display: grid; gap: 12px; }
+
+.audio-button {
+  width: 100%; height: 36px; margin-top: 10px; border-radius: var(--radius);
+  font: inherit; font-size: 14px; cursor: pointer;
+  background: var(--accent-soft); color: var(--accent); border: 0.5px solid var(--accent);
+}

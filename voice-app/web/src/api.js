@@ -17,23 +17,28 @@ async function fetchJsonWithTimeout(url, options, timeoutMs) {
 export async function fetchVoiceConfig() {
   try {
     const { ok, body } = await fetchJsonWithTimeout('/api/config', {}, CONFIG_TIMEOUT_MS)
-    if (ok && body.voiceReady && body.publicKey && body.assistantId) {
-      return { voiceReady: true, publicKey: body.publicKey, assistantId: body.assistantId }
-    }
+    return { voiceReady: ok && body.voiceReady === true }
   } catch (error) {
     console.error('Could not load voice config', error)
+    return { voiceReady: false }
   }
-  return { voiceReady: false, publicKey: '', assistantId: '' }
 }
 
-export async function verifyPatient(patientId) {
+export async function verifyPatientAndOpenCall(patientId) {
   try {
     const { ok, body } = await fetchJsonWithTimeout(
       '/api/patients/verify',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ patientId }) },
       VERIFY_TIMEOUT_MS,
     )
-    if (ok && body.status === 'found') return { found: true, displayName: body.displayName || 'this patient' }
+    if (ok && body.status === 'found' && body.serverUrl && body.participantToken) {
+      return {
+        found: true,
+        displayName: body.displayName || 'this patient',
+        serverUrl: body.serverUrl,
+        participantToken: body.participantToken,
+      }
+    }
     return { found: false, message: body.message || RECORDS_UNREACHABLE }
   } catch (error) {
     console.error('Patient check failed', error)

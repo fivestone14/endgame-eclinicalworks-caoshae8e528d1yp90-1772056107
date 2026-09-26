@@ -67,7 +67,7 @@ function Transcript({ lines, notice, patientName }) {
 
 export default function App() {
   const [patientId, setPatientId] = useState('')
-  const { state, startCall, endCall, markIdEdited, rejectId } = useVoiceCall()
+  const { state, isAudioBlocked, startCall, endCall, resumeAgentAudio, markIdEdited, rejectId } = useVoiceCall()
   const isInCall = state.phase === CallPhase.IN_CALL
   const isBusy = state.phase !== CallPhase.IDLE && !isInCall
   const elapsed = useElapsedSeconds(isInCall)
@@ -120,6 +120,12 @@ export default function App() {
         <button type="submit" className={isInCall ? 'call-button end' : 'call-button'} aria-busy={isBusy}>
           {BUTTON_LABELS[state.phase]}
         </button>
+
+        {isInCall && isAudioBlocked && (
+          <button type="button" className="audio-button" onClick={resumeAgentAudio}>
+            Tap to hear the assistant
+          </button>
+        )}
 
         <section className="call-panel" aria-label="Call transcript">
           <Transcript lines={state.transcript} notice={state.notice} patientName={state.patientName} />
