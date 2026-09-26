@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 from dataclasses import replace
 from unittest.mock import MagicMock
@@ -7,13 +9,12 @@ from unittest.mock import MagicMock
 import pytest
 import requests
 
+from agent import describe_demographics_for_agent, read_patient_id_from_metadata, wait_for_demographics
 from app import create_app
+from demographics import extract_shareable_demographics
 from integuru_client import InteguruClient, LookupOutcome, PatientLookup, classify_integuru_response
 from settings import load_settings
-from vapi_webhook import DEMOGRAPHICS_TOOL_NAME
-from verified_patients import VerifiedPatientCache
 
-SECRET = "test-secret"
 SAMPLE_RECORD = {
     "patient_id": "298724",
     "personal_info": {"fname": "Test", "lname": "Wedge", "dob": "07/07/2000", "sex": "male", "ssn": "123-45-6789"},
@@ -27,9 +28,9 @@ def build_settings(**overrides):
     base = replace(
         load_settings(),
         integuru_api_key="key",
-        vapi_public_key="pub",
-        vapi_assistant_id="asst",
-        vapi_webhook_secret=SECRET,
+        livekit_url="wss://example.livekit.cloud",
+        livekit_api_key="lk-key",
+        livekit_api_secret="lk-secret-that-is-long-enough-for-hs256",
     )
     return replace(base, **overrides)
 
@@ -41,16 +42,9 @@ def build_client(outcome, record=None, settings=None):
     return app.test_client(), integuru
 
 
-def build_tool_call_payload(patient_id_in_call="298724", patient_id_in_arguments="298724", tool_name=DEMOGRAPHICS_TOOL_NAME):
-    return {
-        "message": {
-            "type": "tool-calls",
-            "call": {"assistantOverrides": {"variableValues": {"patientId": patient_id_in_call}}},
-            "toolCallList": [
-                {"id": "call-1", "type": "function", "function": {"name": tool_name, "arguments": {"patient_id": patient_id_in_arguments}}}
-            ],
-        }
-    }
+def decode_jwt_claims(token: str) -> dict:
+    payload = token.split(".")[1]
+    return json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
 
 
 @pytest.mark.parametrize("body", [None, {}, {"patientId": ""}, {"patientId": "12ab"}, {"patientId": "12345678901"}, "not json"])
@@ -65,78 +59,89 @@ def test_verify_rejects_invalid_patient_ids(body):
     "outcome, expected_status",
     [(LookupOutcome.NOT_FOUND, 404), (LookupOutcome.UNAVAILABLE, 503), (LookupOutcome.AUTH_FAILED, 503)],
 )
-def test_verify_maps_failures_to_friendly_messages(outcome, expected_status):
+def test_verify_maps_failures_to_friendly_messages_without_token(outcome, expected_status):
     client, _ = build_client(outcome)
     response = client.post("/api/patients/verify", json={"patientId": "298724"})
-    assert response.status_code == expected_status
-    assert response.get_json()["message"]
-
-
-def test_verify_returns_display_name_without_record():
-    client, _ = build_client(LookupOutcome.FOUND, SAMPLE_RECORD)
-    response = client.post("/api/patients/verify", json={"patientId": " 298724 "})
     body = response.get_json()
-    assert response.status_code == 200
-    assert body == {"status": "found", "patientId": "298724", "displayName": "Test Wedge"}
+    assert response.status_code == expected_status
+    assert body["message"]
+    assert "participantToken" not in body
 
 
-def test_webhook_rejects_wrong_secret():
+def test_verify_refuses_when_livekit_not_configured():
+    client, integuru = build_client(LookupOutcome.FOUND, SAMPLE_RECORD, build_settings(livekit_api_secret=""))
+    response = client.post("/api/patients/verify", json={"patientId": "298724"})
+    assert response.status_code == 503
+    assert response.get_json()["status"] == "voice_unavailable"
+    integuru.read_patient.assert_not_called()
+
+
+def test_verify_returns_call_token_that_only_carries_the_patient_id():
     client, _ = build_client(LookupOutcome.FOUND, SAMPLE_RECORD)
-    response = client.post("/api/vapi/webhook", json=build_tool_call_payload(), headers={"X-Vapi-Secret": "wrong"})
-    assert response.status_code == 401
+    body = client.post("/api/patients/verify", json={"patientId": " 298724 "}).get_json()
+    claims = decode_jwt_claims(body["participantToken"])
+    dispatch = claims["roomConfig"]["agents"][0]
+
+    assert body["status"] == "found" and body["displayName"] == "Test Wedge"
+    assert body["serverUrl"] == "wss://example.livekit.cloud"
+    assert dispatch["agentName"] == "patient-demographics"
+    assert json.loads(dispatch["metadata"]) == {"patientId": "298724"}
+    assert "Wedge" not in json.dumps(claims) and "123-45-6789" not in json.dumps(claims)
 
 
-def test_webhook_rejects_everything_when_secret_unset():
-    client, _ = build_client(LookupOutcome.FOUND, SAMPLE_RECORD, build_settings(vapi_webhook_secret=""))
-    response = client.post("/api/vapi/webhook", json=build_tool_call_payload(), headers={"X-Vapi-Secret": ""})
-    assert response.status_code == 401
-
-
-def test_webhook_answers_verified_patient_without_ssn_or_insurance():
+def test_each_call_gets_its_own_room():
     client, _ = build_client(LookupOutcome.FOUND, SAMPLE_RECORD)
-    client.post("/api/patients/verify", json={"patientId": "298724"})
-    response = client.post("/api/vapi/webhook", json=build_tool_call_payload(), headers={"X-Vapi-Secret": SECRET})
-    result = response.get_json()["results"][0]
-    shared = json.loads(result["result"])
-    assert result["toolCallId"] == "call-1"
-    assert shared["date_of_birth"] == "07/07/2000"
-    assert shared["primary_care_provider"] == "1st, Attempt"
-    assert "ssn" not in json.dumps(shared) and "123-45-6789" not in json.dumps(shared)
-    assert "insurance" not in json.dumps(shared)
-    assert "email" not in shared
+    rooms = {
+        decode_jwt_claims(client.post("/api/patients/verify", json={"patientId": "298724"}).get_json()["participantToken"])["video"]["room"]
+        for _ in range(3)
+    }
+    assert len(rooms) == 3
 
 
-def test_webhook_refuses_unverified_patient():
-    client, _ = build_client(LookupOutcome.FOUND, SAMPLE_RECORD)
-    response = client.post("/api/vapi/webhook", json=build_tool_call_payload(), headers={"X-Vapi-Secret": SECRET})
-    assert "verified" in response.get_json()["results"][0]["result"]
+def test_config_reports_voice_readiness():
+    ready_client, _ = build_client(LookupOutcome.FOUND)
+    missing_client, _ = build_client(LookupOutcome.FOUND, settings=build_settings(livekit_url=""))
+    assert ready_client.get("/api/config").get_json() == {"voiceReady": True}
+    assert missing_client.get("/api/config").get_json() == {"voiceReady": False}
 
 
-def test_webhook_refuses_patient_other_than_the_call_patient():
-    client, _ = build_client(LookupOutcome.FOUND, SAMPLE_RECORD)
-    client.post("/api/patients/verify", json={"patientId": "298724"})
-    payload = build_tool_call_payload(patient_id_in_arguments="111111")
-    response = client.post("/api/vapi/webhook", json=payload, headers={"X-Vapi-Secret": SECRET})
-    assert "verified" in response.get_json()["results"][0]["result"]
+@pytest.mark.parametrize(
+    "metadata, expected",
+    [('{"patientId": "298724"}', "298724"), ("", None), (None, None), ("not json", None), ('{"patientId": "12ab"}', None), ('["298724"]', None)],
+)
+def test_agent_reads_patient_id_from_dispatch_metadata(metadata, expected):
+    assert read_patient_id_from_metadata(metadata) == expected
 
 
-@pytest.mark.parametrize("payload", [None, {}, {"message": "x"}, {"message": {"type": "status-update"}}, {"message": {"type": "tool-calls", "toolCallList": "bad"}}])
-def test_webhook_survives_malformed_payloads(payload):
-    client, _ = build_client(LookupOutcome.FOUND, SAMPLE_RECORD)
-    response = client.post("/api/vapi/webhook", json=payload, headers={"X-Vapi-Secret": SECRET})
-    assert response.status_code == 200
+def test_agent_shares_demographics_without_ssn_or_insurance():
+    shared = describe_demographics_for_agent(extract_shareable_demographics(SAMPLE_RECORD))
+    parsed = json.loads(shared)
+    assert parsed["patient_name"] == "Test Wedge"
+    assert parsed["primary_care_provider"] == "1st, Attempt"
+    assert "123-45-6789" not in shared and "secret plan" not in shared
+    assert "email" not in parsed
 
 
-def test_webhook_answers_unknown_tool_safely():
-    client, _ = build_client(LookupOutcome.FOUND, SAMPLE_RECORD)
-    payload = build_tool_call_payload(tool_name="delete_everything")
-    response = client.post("/api/vapi/webhook", json=payload, headers={"X-Vapi-Secret": SECRET})
-    assert response.get_json()["results"][0]["result"] == "That tool isn't available."
+def test_agent_falls_back_when_record_is_missing():
+    assert describe_demographics_for_agent(None) == "I couldn't get that record right now. Please end the call and try again."
 
 
-def test_config_hides_keys_when_voice_not_configured():
-    client, _ = build_client(LookupOutcome.FOUND, settings=build_settings(vapi_public_key=""))
-    assert client.get("/api/config").get_json() == {"voiceReady": False, "publicKey": "", "assistantId": ""}
+def test_agent_stops_waiting_for_a_slow_record():
+    async def run_scenario():
+        never_finishes = asyncio.get_running_loop().create_future()
+        return await wait_for_demographics(never_finishes, timeout_seconds=0.01)
+
+    assert asyncio.run(run_scenario()) is None
+
+
+def test_agent_stops_waiting_when_lookup_fails():
+    async def run_scenario():
+        async def failing_lookup():
+            raise RuntimeError("boom")
+
+        return await wait_for_demographics(asyncio.create_task(failing_lookup()), timeout_seconds=1)
+
+    assert asyncio.run(run_scenario()) is None
 
 
 @pytest.mark.parametrize(
@@ -152,7 +157,7 @@ def test_config_hides_keys_when_voice_not_configured():
         (200, {"status_code": 500, "body": {"error": "session expired"}}, LookupOutcome.UNAVAILABLE),
         (200, {"status_code": 400, "body": {"error": "bad input"}}, LookupOutcome.UNAVAILABLE),
         (200, {"output": {"personal_info": {"fname": "", "lname": "", "dob": ""}}}, LookupOutcome.NOT_FOUND),
-        (200, {"output": {"status_code": 200, "body": SAMPLE_RECORD}}, LookupOutcome.FOUND),
+        (200, {"status_code": 200, "body": SAMPLE_RECORD, "success": True, "request_id": "r1"}, LookupOutcome.FOUND),
         (200, SAMPLE_RECORD, LookupOutcome.FOUND),
     ],
 )
@@ -173,11 +178,3 @@ def test_integuru_client_without_key_does_not_call_api():
     client = InteguruClient(build_settings(integuru_api_key=""), http)
     assert client.read_patient("298724").outcome is LookupOutcome.AUTH_FAILED
     http.post.assert_not_called()
-
-
-def test_verified_patient_cache_expires_entries():
-    now = [0.0]
-    cache = VerifiedPatientCache(lifetime_seconds=10, clock=lambda: now[0])
-    cache.remember("1", {"first_name": "A"})
-    now[0] = 11
-    assert cache.recall("1") is None
